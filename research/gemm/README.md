@@ -78,31 +78,37 @@ These estimates exclude runtime reservations, allocation padding, temporary
 buffers, and host reference storage. The four cards' memory is not pooled by
 this single-device benchmark.
 
-The default is **out-of-box matmul selection**: no `program_config` and no
-`core_grid` argument, matching the selector used by `GEMM_FLOPS`'s `oob` mode.
-TTNN chooses the implementation, per-core partitions, output blocks, register
-subblocks and K chunks. There is no local blocking policy or L1-buffer estimator.
-The CSV records `blocking_policy=oob`; Tracy's standard operation report records
-the effective program configuration and participating core count.
+The default uses **one manual reuse policy** for every shape and allowed grid:
+2D multicast, output blocks up to 8x8 tiles, K chunks up to eight tiles, and
+compatible register subblocks up to four tiles with FP32 accumulation. Small
+partitions clamp the target block dimensions. The policy is deterministic; it
+does not search configurations using measured performance.
 
-For core-scaling experiments, entries such as `(4,4)` in `CORE_GRIDS` pass only
-`core_grid=ttnn.CoreGrid(x=4,y=4)`. TTNN still selects blocking automatically;
-these cases are labeled `blocking_policy=auto_grid`. In this checkout, explicitly
-supplying a grid invokes a different auto-configuration path than omitting it,
-even when the supplied grid is the full device grid. `None` therefore omits the
-argument rather than passing an explicit full grid.
+Per-core output ownership rounds up to block multiples. For the S=32768 cube,
+the natural 103x94 partition becomes 104x96 tiles, allowing 8x8 output blocks and
+2x2 register subblocks. The completed out-of-box run chose 103x1 and 1x1 blocks
+instead and measured about 24.5 TFLOPS. Avoiding the prime-divisor restriction
+should remove that particular configuration cliff; a speedup still needs hardware
+validation. Shape-dependent traffic, padding, core utilization and other effects
+can still produce performance differences.
 
-The reference benchmark also has `tuned_2d_dram` and `tuned_2d_l1` modes that
-construct program configurations explicitly. Earlier research runs used local
-explicit configurations, including a temporary 1x1 workaround and the later
-`blocking_policy=reuse` recipe. Those results remain separate from out-of-box
-measurements.
+Logical tensors and useful work stay fixed. CSV rows record effective blocking,
+extra output tiles in partial edge blocks, and `blocking_policy=manual`.
+Principal BF16-input/BF16-output/FP32-partial buffers are bounded to 1 MiB; an
+8x8 block with K chunk eight uses 896 KiB. This estimate excludes runtime and
+profiler reservations. Actual L1 allocation remains authoritative.
+
+The implementation is `MatmulMultiCoreReuseMultiCastProgramConfig`, also used by
+GEMM_FLOPS's tuned DRAM mode. The earlier out-of-box benchmark is preserved in
+commit `431fde920d8`. Keep its measurements separate from this manual policy's
+results. Earlier local recipes, including 1x1 output blocks and `reuse`, also
+remain identifiable in their original CSVs.
 
 Numerical settings remain BF16/HiFi2, FP32 destination accumulation enabled,
 approximate math disabled, and packer L1 accumulation enabled. `GEMM_FLOPS` uses
 FP32 destination accumulation disabled and approximate math enabled, including
-in its `oob` mode. Automatic program selection alone does not make the settings
-identical or guarantee matching throughput. See [the reference benchmark](../../tests/ttnn/unit_tests/benchmarks/test_benchmark.py).
+in its `oob` mode. Matching the implementation family alone does not make the
+settings identical or guarantee matching throughput. See [the reference benchmark](../../tests/ttnn/unit_tests/benchmarks/test_benchmark.py).
 
 Before allocating a case, the benchmark checks currently free, contiguous DRAM
 per bank. The estimate includes rounding each of the three BF16 allocations to
@@ -131,11 +137,10 @@ reduce over the complete K dimension. Tile slicing/readback and all validation
 remain outside the measured intervals, before warmup and after measurement.
 Sampled validation checks 5,120 output elements; it is not full-output verification.
 
-The nine-scale sweep completed with the earlier 1x1 policy. CPU checks verify
-automatic selection is requested, explicit experimental grids are forwarded,
-and batching and validation are preserved. Out-of-box execution still needs
-on-card validation across all scales and shapes; errors are preserved rather
-than retried with a custom program configuration. The
+The nine-scale sweep completed with both earlier 1x1 and out-of-box policies.
+CPU checks verify manual blocking across all shapes and five grid sizes,
+including the prime-partition cases, and preserve batching and validation. This
+manual policy still needs on-card validation across all scales and shapes. The
 largest logical tensor alone is 22.78 GiB, so host staging and transfer buffers
 still require substantial RAM.
 
@@ -183,12 +188,14 @@ The final CSV records both metrics explicitly:
 | `validation_mode`, `validation_elements` | Full-output or sampled-tile checks and number of checked elements |
 | `dram_tensor_allocation_bytes`, `dram_free_bytes_before` | Estimated tile-page allocation and available DRAM before the case |
 | `input_generation`, `input_generation_chunk_elements` | `torch_float32_chunked_to_bfloat16` and the maximum FP32 scratch element count; older runs used `torch_bfloat16` |
-| `blocking_policy` | `oob` for unconstrained automatic selection, `auto_grid` for automatic selection with an experimental grid |
+| `blocking_policy` | `manual` for the fixed reuse policy; older runs include `oob`, `auto_grid` and `reuse` |
+| `per_core_m_tiles`, `per_core_n_tiles`, `grid_padding_tiles` | Rounded per-core ownership and extra output tiles in partial edge blocks |
+| `out_block_h_tiles`, `out_block_w_tiles`, `out_subblock_h_tiles`, `out_subblock_w_tiles`, `in0_block_w_tiles` | Effective output/register blocks and K chunk |
+| `estimated_l1_buffer_bytes` | Principal buffer estimate excluding runtime/profiler reservations |
 | `fp32_dest_acc_en`, `math_approx_mode`, `packer_l1_acc` | Numerical/accumulation settings |
 
-Earlier explicit-configuration CSVs retain their per-core/block sizes and L1
-estimates. New CSVs omit those local estimates; the effective automatic program
-configuration is available in Tracy's operation report.
+Tracy's operation report also records the effective program configuration.
+Earlier out-of-box CSVs omit the local block sizes and L1 estimate.
 
 With profiling disabled, host metrics are still recorded on every batch and the
 device columns are empty. Profiling enabled requires device results for every

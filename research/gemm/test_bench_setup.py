@@ -117,7 +117,7 @@ def test_failed_upload_releases_already_allocated_input(monkeypatch):
 
 @pytest.mark.parametrize("scale, expected_iterations", [(512, 20), (16384, 2), (55296, 1)])
 @pytest.mark.parametrize("core_grid", [None, (4, 4)])
-def test_auto_matmul_preserves_grid_batch_counts_and_csv(monkeypatch, scale, expected_iterations, core_grid):
+def test_manual_matmul_preserves_grid_batch_counts_and_csv(monkeypatch, scale, expected_iterations, core_grid):
     output = SimpleNamespace(shape=(scale, scale), padded_shape=(scale, scale))
     input_a = SimpleNamespace(padded_shape=(scale, scale))
     device = SimpleNamespace(compute_with_storage_grid_size=lambda: SimpleNamespace(x=11, y=10), arch=lambda: None)
@@ -148,17 +148,56 @@ def test_auto_matmul_preserves_grid_batch_counts_and_csv(monkeypatch, scale, exp
     assert {int(row["work_scale"]) for row in rows} == {scale}
     assert {row["input_generation"] for row in rows} == {bench.INPUT_GENERATION}
     assert {int(row["input_generation_chunk_elements"]) for row in rows} == {bench.HOST_RANDOM_CHUNK_ELEMENTS}
-    assert {row["blocking_policy"] for row in rows} == {"oob" if core_grid is None else "auto_grid"}
+    assert {row["blocking_policy"] for row in rows} == {"manual"}
     assert {(int(row["grid_x"]), int(row["grid_y"])) for row in rows} == {core_grid or (11, 10)}
     assert len(calls) == 1 + min(bench.NUM_WARMUP_ITERATIONS, expected_iterations) + 5 * expected_iterations
     for kwargs in calls:
-        assert "program_config" not in kwargs
+        config = kwargs["program_config"]
+        assert (config.compute_with_storage_grid_size.x, config.compute_with_storage_grid_size.y) == (
+            core_grid or (11, 10)
+        )
+        assert {int(row["per_core_m_tiles"]) for row in rows} == {config.per_core_M}
+        assert {int(row["out_block_w_tiles"]) for row in rows} == {config.out_block_w}
+        assert {int(row["in0_block_w_tiles"]) for row in rows} == {config.in0_block_w}
         assert kwargs["optional_output_tensor"] is output
-        if core_grid is None:
-            assert "core_grid" not in kwargs
-        else:
-            assert (kwargs["core_grid"].x, kwargs["core_grid"].y) == core_grid
+        assert "core_grid" not in kwargs
     assert len(checks) == 2
+
+
+def test_manual_blocks_cover_all_shapes_and_grids_with_bounded_l1():
+    for scale in WORK_SCALES:
+        for shape in fixed_flop_shapes(scale):
+            mt, kt, nt = (dimension // 32 for dimension in shape)
+            for gx, gy in ((1, 1), (2, 2), (4, 4), (8, 8), (11, 10)):
+                config, metadata = bench.make_program_config(shape, (gx, gy))
+                pm, pn = config.per_core_M, config.per_core_N
+                bh, bw = config.out_block_h, config.out_block_w
+                sh, sw = config.out_subblock_h, config.out_subblock_w
+                assert pm % bh == pn % bw == bh % sh == bw % sw == kt % config.in0_block_w == 0
+                assert 0 < sh * sw <= 4
+                assert pm <= mt and pn <= nt
+                rows, columns = (mt + pm - 1) // pm, (nt + pn - 1) // pn
+                assert rows <= gy and columns <= gx
+                assert metadata["grid_padding_tiles"] == rows * columns * pm * pn - mt * nt
+                assert 0 < metadata["estimated_l1_buffer_bytes"] <= bench.L1_BUFFER_BUDGET_BYTES
+
+
+def test_prime_partition_cliff_keeps_reusable_blocks():
+    for scale, ownership in ((32768, (104, 96)), (55296, (176, 160))):
+        config, metadata = bench.make_program_config((scale, scale, scale), (11, 10))
+        assert (config.per_core_M, config.per_core_N) == ownership
+        assert (config.out_block_h, config.out_block_w) == (8, 8)
+        assert (config.out_subblock_h, config.out_subblock_w) == (2, 2)
+        assert config.in0_block_w == 8
+        assert metadata["estimated_l1_buffer_bytes"] == 917504
+    # This shape exhausted L1 with the original full-per-core blocks.
+    assert bench.make_program_config((2048, 512, 8192), (11, 10))[1]["estimated_l1_buffer_bytes"] < 2**20
+
+
+def test_manual_blocks_reject_buffers_above_budget(monkeypatch):
+    monkeypatch.setattr(bench, "L1_BUFFER_BUDGET_BYTES", 512 * 2**10)
+    with pytest.raises(ValueError, match="above.*budget"):
+        bench.make_program_config((32768, 32768, 32768), (11, 10))
 
 
 @pytest.mark.parametrize("comparison", ["shape", "grid"])

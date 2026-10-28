@@ -8,6 +8,7 @@ import csv
 import os
 from contextlib import contextmanager
 from datetime import datetime
+from math import ceil
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
@@ -21,7 +22,7 @@ from research.gemm.shapes import WORK_SCALES as DEFAULT_WORK_SCALES
 from research.gemm.shapes import METADATA_COLUMNS, fixed_flop_shapes, shape_metadata, write_manifest
 
 # --- Experiment settings ---
-# Dimensions are elements; grid is (columns, rows). TTNN chooses blocking.
+# Dimensions are elements; grid is (columns, rows).
 WORK_SCALES = DEFAULT_WORK_SCALES  # Sweep every fixed-FLOP cohort in one invocation.
 CORE_GRIDS = [None]  # Allow the full available grid; small shapes may use fewer cores.
 SEED = 0
@@ -35,6 +36,11 @@ MATH_APPROX_MODE = False
 INPUT_MEMORY_CONFIG = ttnn.DRAM_MEMORY_CONFIG
 OUTPUT_MEMORY_CONFIG = ttnn.DRAM_MEMORY_CONFIG
 MAX_RELATIVE_RMSE = 0.02
+
+# Use one fixed reuse policy across shapes, rather than TTNN's divisor search.
+OUTPUT_BLOCK_TILES = (8, 8)
+MAX_K_BLOCK_TILES = 8
+L1_BUFFER_BUDGET_BYTES = 2**20  # Principal buffers; excludes runtime/profiler reservations.
 
 # --- Repetition and memory limits ---
 # Large matrices use fewer repetitions and sampled output checks.
@@ -52,6 +58,17 @@ RESULTS_DIR = Path(__file__).parent / "results"
 # --- Result metadata ---
 # These fields accompany every timed batch; shape metadata comes from shapes.py.
 TILE_SIZE = 32
+BLOCKING_COLUMNS = (
+    "per_core_m_tiles",
+    "per_core_n_tiles",
+    "grid_padding_tiles",
+    "out_block_h_tiles",
+    "out_block_w_tiles",
+    "out_subblock_h_tiles",
+    "out_subblock_w_tiles",
+    "in0_block_w_tiles",
+    "estimated_l1_buffer_bytes",
+)
 LAYOUT_COLUMNS = (
     "padded_m",
     "padded_k",
@@ -65,10 +82,69 @@ LAYOUT_COLUMNS = (
     "input_generation",
     "input_generation_chunk_elements",
     "blocking_policy",
+    *BLOCKING_COLUMNS,
     "fp32_dest_acc_en",
     "math_approx_mode",
     "packer_l1_acc",
 )
+
+
+# --- Program configuration ---
+
+
+def make_program_config(shape, grid):
+    """Keep reusable blocks even when the natural per-core partition is prime."""
+    grid_x, grid_y = grid
+    mt, kt, nt = (dimension // TILE_SIZE for dimension in shape)
+
+    def partition(tiles, cores, target_block):
+        ownership = ceil(tiles / cores)
+        block = min(target_block, ownership)
+        # Round ownership to block multiples without exceeding the whole tensor.
+        while ceil(ownership / block) * block > tiles:
+            block -= 1
+        return ceil(ownership / block) * block, block
+
+    per_core_m, block_h = partition(mt, grid_y, OUTPUT_BLOCK_TILES[0])
+    per_core_n, block_w = partition(nt, grid_x, OUTPUT_BLOCK_TILES[1])
+    k_block = next(size for size in range(min(MAX_K_BLOCK_TILES, kt), 0, -1) if kt % size == 0)
+    subblocks = [(4, 2), (2, 4), (8, 1), (1, 8), (2, 2), (4, 1), (1, 4), (3, 1), (1, 3), (2, 1), (1, 2), (1, 1)]
+    sub_h, sub_w = next(
+        (h, w)
+        for h, w in subblocks
+        if block_h % h == 0 and block_w % w == 0 and h * w <= (4 if FP32_DEST_ACC_EN else 8)
+    )
+    # Double-buffered BF16 inputs, BF16 output and separate accumulation tiles.
+    l1_bytes = 2 * k_block * (block_h + block_w) * 2048
+    l1_bytes += block_h * block_w * (2048 + (4096 if FP32_DEST_ACC_EN else 2048))
+    if l1_bytes > L1_BUFFER_BUDGET_BYTES:
+        raise ValueError(f"Principal L1 buffers need {l1_bytes} B, above the {L1_BUFFER_BUDGET_BYTES} B budget")
+    config = ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(grid_x, grid_y),
+        per_core_M=per_core_m,
+        per_core_N=per_core_n,
+        out_block_h=block_h,
+        out_block_w=block_w,
+        out_subblock_h=sub_h,
+        out_subblock_w=sub_w,
+        in0_block_w=k_block,
+        transpose_mcast=False,
+        fused_activation=None,
+    )
+    # Logical tensors stay unchanged; count extra output work in partial edge blocks.
+    active_rows, active_columns = ceil(mt / per_core_m), ceil(nt / per_core_n)
+    metadata = dict(
+        per_core_m_tiles=per_core_m,
+        per_core_n_tiles=per_core_n,
+        grid_padding_tiles=active_rows * active_columns * per_core_m * per_core_n - mt * nt,
+        out_block_h_tiles=block_h,
+        out_block_w_tiles=block_w,
+        out_subblock_h_tiles=sub_h,
+        out_subblock_w_tiles=sub_w,
+        in0_block_w_tiles=k_block,
+        estimated_l1_buffer_bytes=l1_bytes,
+    )
+    return config, metadata
 
 
 # --- Tensor preparation and correctness ---
@@ -226,17 +302,19 @@ def run_case(device, shape, core_grid, dtype, math_fidelity, csv_file, work_scal
     writer = csv.writer(csv_file)
     available_grid = device.compute_with_storage_grid_size()
     grid_x, grid_y = (available_grid.x, available_grid.y) if core_grid is None else core_grid
-    # Omit core_grid for the standard out-of-box path; explicit grids use TTNN's
-    # constrained auto-selection path, even when they span the full device.
-    grid_options = {} if core_grid is None else {"core_grid": ttnn.CoreGrid(x=grid_x, y=grid_y)}
-    blocking_policy = "oob" if core_grid is None else "auto_grid"
+    program_config, blocking = make_program_config(shape, (grid_x, grid_y))
 
     print(
         f"family={metadata['shape_family']}, work_scale={work_scale}, "
         f"FLOPs={metadata['useful_flops']}, logical_BF16_GiB={metadata['logical_bytes'] / 2**30:.6f}, "
         f"M={m}, K={k}, N={n}, grid={grid_x}x{grid_y}, "
         f"available_grid={available_grid.x}x{available_grid.y}, "
-        f"blocking_policy={blocking_policy}, "
+        f"blocking_policy=manual, "
+        f"output_tiles_per_core={blocking['per_core_m_tiles']}x{blocking['per_core_n_tiles']}, "
+        f"output_block={blocking['out_block_h_tiles']}x{blocking['out_block_w_tiles']}, "
+        f"output_subblock={blocking['out_subblock_h_tiles']}x{blocking['out_subblock_w_tiles']}, "
+        f"K_block_tiles={blocking['in0_block_w_tiles']}, "
+        f"estimated_L1_buffers_KiB={blocking['estimated_l1_buffer_bytes'] / 1024:.1f}, "
         f"matmuls_per_batch={iterations}, warmups={warmups}, "
         f"DRAM_free_GiB={dram_free / 2**30:.3f}"
     )
@@ -264,22 +342,23 @@ def run_case(device, shape, core_grid, dtype, math_fidelity, csv_file, work_scal
         dram_free,
         INPUT_GENERATION,
         HOST_RANDOM_CHUNK_ELEMENTS,
-        blocking_policy,
+        "manual",
+        *[blocking[column] for column in BLOCKING_COLUMNS],
         FP32_DEST_ACC_EN,
         MATH_APPROX_MODE,
         PACKER_L1_ACC,
     ]
 
     def matmul():
-        # TTNN selects the implementation and blocks; no program_config is supplied.
+        # Hold the multicast family and reuse policy fixed throughout the sweep.
         return ttnn.matmul(
             a,
             b,
+            program_config=program_config,
             compute_kernel_config=compute_config,
             memory_config=OUTPUT_MEMORY_CONFIG,
             dtype=dtype,
             optional_output_tensor=output,
-            **grid_options,
         )
 
     try:
